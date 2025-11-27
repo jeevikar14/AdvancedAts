@@ -114,6 +114,7 @@ class AdvancedATSApp:
         st.session_state.setdefault('shortlisted_candidates', [])
         st.session_state.setdefault('recruiter_jds', [])
         st.session_state.setdefault('selected_jd', None)
+        st.session_state.setdefault('uploaded_resume_ids', set())  # Track uploaded resume IDs
             
     def _rerun(self):
         """Safe rerun method"""
@@ -139,8 +140,9 @@ class AdvancedATSApp:
         if model_status['ml_model'] == 'Trained':
             st.sidebar.success("✅ ATS Model: Trained")
             if 'metrics' in model_status:
-                st.sidebar.info(f"R² Score: {model_status['metrics'].get('r2', 0):.3f}")
-                st.sidebar.info(f"MAE: {model_status['metrics'].get('mae', 0):.2f}")
+                metrics = model_status['metrics']
+                st.sidebar.info(f"R² Score: {metrics.get('r2_test', 0):.3f}")
+                st.sidebar.info(f"MAE: {metrics.get('mae', 0):.2f}")
         else:
             st.sidebar.error("❌ ATS Model: Not Found")
             st.sidebar.warning("⚠️ Please run train_model.py first!")
@@ -163,7 +165,8 @@ class AdvancedATSApp:
         st.sidebar.subheader("⚡ Quick Actions")
         
         if st.sidebar.button("🔄 Clear Session", use_container_width=True):
-            st.session_state.clear()
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             self._rerun()
         
         if st.sidebar.button("📊 View Stats", use_container_width=True):
@@ -171,15 +174,27 @@ class AdvancedATSApp:
 
     def show_database_stats(self):
         """Show database statistics"""
-        resumes = self.db_manager.get_all_resumes()
-        jds = self.db_manager.get_all_jds()
-        
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("### 📈 Database Stats")
-        st.sidebar.write(f"📄 Resumes: {len(resumes)}")
-        st.sidebar.write(f"📋 Job Descriptions: {len(jds)}")
-        st.sidebar.write(f"👥 Recruiter Uploads: {len(st.session_state.recruiter_resumes)}")
-        st.sidebar.write(f"⭐ Shortlisted: {len(st.session_state.shortlisted_candidates)}")
+        try:
+            resumes = self.db_manager.get_all_resumes()
+            jds = self.db_manager.get_all_jds()
+            
+            st.sidebar.markdown("---")
+            st.sidebar.markdown("### 📈 Database Stats")
+            st.sidebar.write(f"📄 Resumes in DB: {len(resumes)}")
+            st.sidebar.write(f"📋 Job Descriptions: {len(jds)}")
+            
+            # Session stats
+            st.sidebar.markdown("### 📊 Session Stats")
+            st.sidebar.write(f"👥 Recruiter Uploads: {len(st.session_state.get('recruiter_resumes', []))}")
+            st.sidebar.write(f"⭐ Shortlisted: {len(st.session_state.get('shortlisted_candidates', []))}")
+            
+            # Calculate screening stats
+            screened = [c for c in st.session_state.get('recruiter_resumes', []) if c.get('ats_score', 0) > 0]
+            if screened:
+                avg_score = sum(c['ats_score'] for c in screened) / len(screened)
+                st.sidebar.write(f"📊 Avg ATS Score: {avg_score:.1f}")
+        except Exception as e:
+            st.sidebar.error(f"Error loading stats: {str(e)}")
 
     def job_seeker_portal(self):
         """Job Seeker Portal"""
@@ -352,7 +367,7 @@ class AdvancedATSApp:
         resume_text = st.session_state.current_resume['text']
         jd_text = st.session_state.current_jd['text']
         
-        with st.spinner("🔄 Analyzing compatibility..."):
+        with st.spinner("📄 Analyzing compatibility..."):
             try:
                 features, resume_emb, jd_emb = self.ats_inference.extract_features(resume_text, jd_text)
                 
@@ -581,7 +596,7 @@ class AdvancedATSApp:
             self.screen_candidates_section()
     
     def upload_resumes_section(self):
-        """Section for recruiters to upload multiple resumes"""
+        """Section for recruiters to upload multiple resumes - FIXED DUPLICATE BUG"""
         st.subheader("📄 Upload Candidate Resumes")
         
         st.info("💡 Upload multiple resumes to build your candidate pool. These will appear in the screening section.")
@@ -594,15 +609,24 @@ class AdvancedATSApp:
         )
         
         if uploaded_files:
+            # Process each file only once
             for resume_file in uploaded_files:
+                # Create unique file identifier using hash of content
+                file_bytes = resume_file.getvalue()
+                file_hash = hash(file_bytes)
+                
+                # Check if this file has already been processed
+                if file_hash in st.session_state.uploaded_resume_ids:
+                    continue
+                
                 with st.spinner(f"📄 Processing {resume_file.name}..."):
-                    file_bytes = resume_file.getvalue()
                     resume_text = self.file_parser.parse_file(file_bytes, resume_file.name)
                     
                     if resume_text:
                         candidate_id = str(uuid.uuid4())[:8]
                         candidate = {
                             'id': candidate_id,
+                            'file_hash': file_hash,
                             'name': f"Candidate_{candidate_id}",
                             'email': f"candidate_{candidate_id}@company.com",
                             'resume_text': resume_text,
@@ -614,12 +638,10 @@ class AdvancedATSApp:
                             'experience': self.extract_experience_from_resume(resume_text)
                         }
                         
-                        existing_ids = [c['id'] for c in st.session_state.recruiter_resumes]
-                        if candidate_id not in existing_ids:
-                            st.session_state.recruiter_resumes.append(candidate)
-                            st.success(f"✅ {resume_file.name} uploaded successfully!")
-                        else:
-                            st.info(f"ℹ️ {resume_file.name} already uploaded")
+                        # Add to session state and mark as processed
+                        st.session_state.recruiter_resumes.append(candidate)
+                        st.session_state.uploaded_resume_ids.add(file_hash)
+                        st.success(f"✅ {resume_file.name} uploaded successfully!")
                     else:
                         st.error(f"❌ Could not extract text from {resume_file.name}")
         
@@ -645,29 +667,31 @@ class AdvancedATSApp:
                     st.write(f"Uploaded: {candidate['uploaded_at']}")
                 
                 with col3:
-                    if st.button("👀 View", key=f"view_{candidate['id']}"):
+                    # Use unique key for each button
+                    if st.button("👀 View", key=f"view_resume_{candidate['id']}"):
                         with st.expander(f"Resume Content - {candidate['name']}", expanded=True):
-                            st.text_area("Resume Text", candidate['resume_text'], height=200, key=f"resume_{candidate['id']}")
+                            st.text_area("Resume Text", candidate['resume_text'], height=200, key=f"resume_text_{candidate['id']}")
                 
                 st.markdown("---")
         
         if st.session_state.recruiter_resumes and st.button("🗑️ Clear All Resumes", type="secondary"):
             st.session_state.recruiter_resumes = []
+            st.session_state.uploaded_resume_ids = set()
             self._rerun()
     
     def upload_jd_section(self):
-        """Section for uploading job description"""
+        """Section for uploading job description - FIXED DUPLICATE WIDGET BUG"""
         st.subheader("📋 Create Job Description")
         
         jd_file = st.file_uploader(
             "Upload Job Description",
             type=['pdf', 'docx', 'png', 'jpg', 'jpeg', 'txt'],
-            key="recruiter_jd"
+            key="recruiter_jd_file_uploader"
         )
         
         jd_text = st.text_area("Or paste job description", height=200,
                              placeholder="Paste the complete job description here...",
-                             key="recruiter_jd_text")
+                             key="recruiter_jd_textarea")
         
         if jd_file:
             with st.spinner("📄 Parsing job description..."):
@@ -677,17 +701,18 @@ class AdvancedATSApp:
         if jd_text:
             col1, col2 = st.columns(2)
             with col1:
-                title = st.text_input("Job Title*", placeholder="e.g., Senior Python Developer")
+                title = st.text_input("Job Title*", placeholder="e.g., Senior Python Developer", key="jd_title_input")
             with col2:
-                company = st.text_input("Company Name*", placeholder="Your Company")
+                company = st.text_input("Company Name*", placeholder="Your Company", key="jd_company_input")
             
             col3, col4 = st.columns(2)
             with col3:
-                location = st.text_input("Location", "Remote")
+                location = st.text_input("Location", "Remote", key="jd_location_input")
             with col4:
-                experience_required = st.number_input("Years Experience Required", min_value=0, max_value=30, value=3)
+                experience_required = st.number_input("Years Experience Required", min_value=0, max_value=30, value=3, key="jd_exp_input")
             
-            if st.button("💾 Save Job Description", type="primary") and title and company:
+            # FIXED: Unique button key
+            if st.button("💾 Save Job Description", type="primary", key="save_jd_button_unique") and title and company:
                 jd_id = str(uuid.uuid4())[:8]
                 jd_data = {
                     'id': jd_id,
@@ -710,7 +735,7 @@ class AdvancedATSApp:
                 skills = self.extract_skills_from_text(jd_text)
                 if skills:
                     st.write(f"**Key Skills Required:** {', '.join(skills[:10])}")
-            elif st.button("💾 Save Job Description", type="primary"):
+            elif st.button("💾 Save Job Description", type="primary", key="save_jd_button_unique_error"):
                 st.error("❌ Please fill in all required fields (Title and Company)")
     
     def screen_candidates_section(self):
@@ -726,7 +751,7 @@ class AdvancedATSApp:
             return
         
         jd_options = {f"{jd['title']} at {jd['company']}": jd for jd in st.session_state.recruiter_jds}
-        selected_jd_label = st.selectbox("Select Job Description", list(jd_options.keys()))
+        selected_jd_label = st.selectbox("Select Job Description", list(jd_options.keys()), key="select_jd_dropdown")
         selected_jd = jd_options[selected_jd_label]
         
         st.session_state.selected_jd = selected_jd
@@ -735,8 +760,8 @@ class AdvancedATSApp:
         st.write(f"**Location:** {selected_jd['location']} | **Experience Required:** {selected_jd['experience_required']} years")
         st.write(f"**Description Preview:** {selected_jd['description_text'][:200]}...")
         
-        if st.button("🚀 Screen All Candidates", type="primary", use_container_width=True):
-            with st.spinner("🔄 Screening candidates against job description..."):
+        if st.button("🚀 Screen All Candidates", type="primary", use_container_width=True, key="screen_all_btn"):
+            with st.spinner("📄 Screening candidates against job description..."):
                 jd_text = selected_jd['description_text']
                 screened_candidates = []
                 
@@ -767,11 +792,11 @@ class AdvancedATSApp:
             
             col1, col2, col3 = st.columns(3)
             with col1:
-                min_score = st.slider("Minimum ATS Score", 0, 100, 50)
+                min_score = st.slider("Minimum ATS Score", 0, 100, 50, key="min_score_slider")
             with col2:
-                status_filter = st.selectbox("Status Filter", ["All", "Pending", "Shortlisted", "Rejected"])
+                status_filter = st.selectbox("Status Filter", ["All", "Pending", "Shortlisted", "Rejected"], key="status_filter_select")
             with col3:
-                sort_by = st.selectbox("Sort By", ["ATS Score", "Experience", "Name"])
+                sort_by = st.selectbox("Sort By", ["ATS Score", "Experience", "Name"], key="sort_by_select")
             
             filtered_candidates = [c for c in st.session_state.recruiter_resumes 
                                  if c.get('ats_score', 0) >= min_score]
@@ -810,33 +835,33 @@ class AdvancedATSApp:
                 with col3:
                     current_status = candidate['status']
                     if current_status == 'pending':
-                        if st.button("⭐ Shortlist", key=f"shortlist_{candidate['id']}", use_container_width=True):
+                        if st.button("⭐ Shortlist", key=f"shortlist_btn_{candidate['id']}", use_container_width=True):
                             candidate['status'] = 'shortlisted'
                             if candidate['id'] not in [c['id'] for c in st.session_state.shortlisted_candidates]:
                                 st.session_state.shortlisted_candidates.append(candidate)
                             self._rerun()
-                        if st.button("❌ Reject", key=f"reject_{candidate['id']}", use_container_width=True):
+                        if st.button("❌ Reject", key=f"reject_btn_{candidate['id']}", use_container_width=True):
                             candidate['status'] = 'rejected'
                             self._rerun()
                     elif current_status == 'shortlisted':
                         st.success("✅ Shortlisted")
-                        if st.button("↩️ Undo", key=f"undo_short_{candidate['id']}", use_container_width=True):
+                        if st.button("↩️ Undo", key=f"undo_short_btn_{candidate['id']}", use_container_width=True):
                             candidate['status'] = 'pending'
                             st.session_state.shortlisted_candidates = [c for c in st.session_state.shortlisted_candidates if c['id'] != candidate['id']]
                             self._rerun()
                     else:
                         st.error("❌ Rejected")
-                        if st.button("↩️ Undo", key=f"undo_reject_{candidate['id']}", use_container_width=True):
+                        if st.button("↩️ Undo", key=f"undo_reject_btn_{candidate['id']}", use_container_width=True):
                             candidate['status'] = 'pending'
                             self._rerun()
                 
                 with col4:
-                    if st.button("👀 View Resume", key=f"view_res_{candidate['id']}", use_container_width=True):
+                    if st.button("👀 View Resume", key=f"view_res_btn_{candidate['id']}", use_container_width=True):
                         with st.expander(f"Resume - {candidate['name']}", expanded=True):
                             st.text_area("Resume Content", candidate['resume_text'], height=200, 
-                                       key=f"resume_view_{candidate['id']}")
+                                       key=f"resume_view_area_{candidate['id']}")
                     
-                    if st.button("📋 Contact", key=f"contact_{candidate['id']}", use_container_width=True):
+                    if st.button("📋 Contact", key=f"contact_btn_{candidate['id']}", use_container_width=True):
                         st.info(f"Contact: {candidate['email']}")
                 
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -852,7 +877,7 @@ class AdvancedATSApp:
                 with col2:
                     st.metric("Average Score", f"{avg_score:.1f}")
                 
-                if st.button("📤 Export Shortlisted Candidates"):
+                if st.button("📤 Export Shortlisted Candidates", key="export_shortlisted_btn"):
                     shortlisted_data = []
                     for candidate in st.session_state.shortlisted_candidates:
                         shortlisted_data.append({
@@ -871,7 +896,8 @@ class AdvancedATSApp:
                         label="📥 Download CSV",
                         data=csv,
                         file_name=f"shortlisted_candidates_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
+                        mime="text/csv",
+                        key="download_csv_btn"
                     )
 
     def extract_skills_from_text(self, text):

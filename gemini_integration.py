@@ -12,7 +12,7 @@ class FixedGeminiIntegration:
         if self.api_key:
             try:
                 genai.configure(api_key=self.api_key)
-                # Using gemini-2.0-flash-exp for better performance
+               
                 self.model = genai.GenerativeModel('gemini-2.5-flash')
                 
                 # Test the model

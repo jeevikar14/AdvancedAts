@@ -13,6 +13,8 @@ class RobustATSInference:
         self.transformer_model = None
         self.ml_model = None
         self.scaler = None
+        self.pca_jd = None
+        self.pca_res = None
         self.feature_names = []
         self.model_metrics = {}
         
@@ -22,15 +24,16 @@ class RobustATSInference:
             print("✅ Transformer model loaded")
             
             # Load ML model
-            self.ml_model, self.scaler, self.model_metrics = self._load_ml_model()
+            self.ml_model, self.scaler, self.pca_jd, self.pca_res, self.model_metrics = self._load_ml_model()
             
             if self.ml_model is not None:
                 print("✅ Trained ML Model loaded successfully")
                 if self.model_metrics:
-                    print(f"   Model R²: {self.model_metrics.get('r2', 0):.3f}")
+                    print(f"   Model Train R²: {self.model_metrics.get('r2_train', 0):.3f}")
+                    print(f"   Model Test R²: {self.model_metrics.get('r2_test', 0):.3f}")
                     print(f"   Model MAE: {self.model_metrics.get('mae', 0):.2f}")
             else:
-                print("⚠️ Trained model not found. Please run train_model.py first.")
+                print("⚠️ Trained model not found. Please run train_model_improved.py first.")
                 
         except Exception as e:
             print(f"⚠️ Init error: {e}")
@@ -40,58 +43,54 @@ class RobustATSInference:
         try:
             model_path = 'models/optimized_ats_model.pkl'
             if os.path.exists(model_path):
-                with open(model_path, 'rb') as f:
-                    data = joblib.load(f)
+                data = joblib.load(model_path)
                 
                 if isinstance(data, dict) and 'model' in data:
-                    return data['model'], data.get('scaler'), data.get('metrics', {})
-            return None, None, {}
+                    return (
+                        data['model'], 
+                        data.get('scaler'), 
+                        data.get('pca_jd'),
+                        data.get('pca_res'),
+                        data.get('metrics', {})
+                    )
+            return None, None, None, None, {}
         except Exception as e:
             print(f"⚠️ ML model load failed: {e}")
-            return None, None, {}
+            return None, None, None, None, {}
 
     def extract_additional_features(self, resume_text, jd_text):
-        """Extract handcrafted features matching training pipeline"""
+        """Extract handcrafted features - MUST MATCH train_model_improved.py"""
         features = []
         
-        # Text length features
-        features.append(len(resume_text.split()))
-        features.append(len(jd_text.split()))
-        features.append(len(resume_text.split()) / (len(jd_text.split()) + 1))
+        # Length ratio (1 feature)
+        resume_len = len(resume_text.split())
+        jd_len = len(jd_text.split())
+        features.append(resume_len / max(jd_len, 1))
         
-        # Keyword overlap features
+        # Keyword overlap (2 features)
         resume_words = set(resume_text.lower().split())
         jd_words = set(jd_text.lower().split())
         overlap = len(resume_words.intersection(jd_words))
         features.append(overlap)
-        features.append(overlap / (len(jd_words) + 1))
+        features.append(overlap / max(len(jd_words), 1))
         
-        # Section presence features
-        sections = ['education', 'experience', 'skills', 'work', 'projects', 'certifications']
-        for section in sections:
-            features.append(1 if section in resume_text.lower() else 0)
-        
-        # Action verbs count
-        action_verbs = ['managed', 'developed', 'created', 'implemented', 'led', 'designed', 
-                        'built', 'improved', 'increased', 'reduced', 'achieved']
+        # Action verbs count (1 feature)
+        action_verbs = ['managed', 'developed', 'created', 'implemented', 'led', 'designed',
+                        'built', 'improved', 'increased', 'reduced', 'achieved', 'delivered',
+                        'launched', 'established', 'optimized', 'executed', 'coordinated']
         action_verb_count = sum(1 for verb in action_verbs if verb in resume_text.lower())
-        features.append(action_verb_count)
+        features.append(min(action_verb_count, 15))
         
-        # Quantifiable achievements
-        numbers_count = len(re.findall(r'\d+%|\$\d+|\d+\+', resume_text))
-        features.append(numbers_count)
+        # Tech skills match (1 feature)
+        tech_skills = ['python', 'java', 'sql', 'javascript', 'machine learning', 'aws', 'docker', 'kubernetes',
+                       'react', 'angular', 'django', 'flask', 'tensorflow', 'pytorch', 'data science', 'agile', 'scrum']
+        resume_tech = [s for s in tech_skills if s in resume_text.lower()]
+        jd_tech = [s for s in tech_skills if s in jd_text.lower()]
+        features.append(len(set(resume_tech).intersection(set(jd_tech))) / max(len(jd_tech), 1) if jd_tech else 0)
         
-        # Technical skills
-        tech_skills = ['python', 'java', 'sql', 'javascript', 'machine learning', 'aws', 
-                       'docker', 'kubernetes', 'react', 'angular', 'django', 'flask']
-        tech_skills_count = sum(1 for skill in tech_skills if skill in resume_text.lower())
-        features.append(tech_skills_count)
-        
-        # Contact info presence
-        has_email = 1 if '@' in resume_text else 0
-        has_phone = 1 if re.search(r'\d{10}', resume_text) else 0
-        features.append(has_email)
-        features.append(has_phone)
+        # Section presence (3 features)
+        for section in ['experience', 'education', 'skills']:
+            features.append(1 if section in resume_text.lower() else 0)
         
         return np.array(features)
 
@@ -105,14 +104,22 @@ class RobustATSInference:
             resume_emb = self.transformer_model.encode([resume_text])[0]
             jd_emb = self.transformer_model.encode([jd_text])[0]
             
+            # Apply PCA if available
+            if self.pca_jd is not None and self.pca_res is not None:
+                jd_reduced = self.pca_jd.transform([jd_emb])[0]
+                res_reduced = self.pca_res.transform([resume_emb])[0]
+            else:
+                jd_reduced = jd_emb
+                res_reduced = resume_emb
+            
             # Calculate similarity
             similarity = cosine_similarity([resume_emb], [jd_emb])[0][0]
             
             # Extract handcrafted features
             additional_feats = self.extract_additional_features(resume_text, jd_text)
             
-            # Combine features: [JD_Embedding, Resume_Embedding, Cosine_Similarity, Handcrafted_Features]
-            features_vector = np.hstack([jd_emb, resume_emb, [similarity], additional_feats])
+            # Combine features: [JD_PCA, Resume_PCA, Cosine_Similarity, Handcrafted_Features]
+            features_vector = np.hstack([jd_reduced, res_reduced, [similarity], additional_feats])
             
             return features_vector, resume_emb, jd_emb
             
@@ -169,20 +176,23 @@ class RobustATSInference:
             return 0.0
 
     def get_feature_importance(self):
-        """Get feature importance (proxy for visualization)"""
-        return {
-            'Semantic Similarity': 0.35,
-            'Contextual Match': 0.25,
-            'Skill Alignment': 0.20,
-            'Content Quality': 0.12,
-            'Structure': 0.08
-        }
+        """Get feature importance"""
+        if hasattr(self.ml_model, 'feature_importances_'):
+            return {
+                'Semantic Similarity': 0.35,
+                'Contextual Match': 0.25,
+                'Skill Alignment': 0.20,
+                'Content Quality': 0.12,
+                'Structure': 0.08
+            }
+        return {}
 
     def get_model_status(self):
         """Get current model status"""
         status = {
             'transformer': 'Loaded' if self.transformer_model else 'Error',
-            'ml_model': 'Trained' if self.ml_model else 'Not Found'
+            'ml_model': 'Trained' if self.ml_model else 'Not Found',
+            'pca': 'Loaded' if self.pca_jd and self.pca_res else 'Not Found'
         }
         if self.model_metrics:
             status['metrics'] = self.model_metrics
