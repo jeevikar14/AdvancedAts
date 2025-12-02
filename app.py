@@ -11,6 +11,8 @@ import os
 import re
 import time
 import uuid
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Import custom modules
 try:
@@ -88,6 +90,9 @@ st.markdown("""
 .pending {
     border-left: 4px solid #ffc107;
 }
+.entry-level { border-left: 4px solid #17a2b8; background-color: #f0f8ff; }
+.mid-level { border-left: 4px solid #ffc107; background-color: #fffbf0; }
+.senior-level { border-left: 4px solid #28a745; background-color: #f0fff4; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -100,11 +105,48 @@ class AdvancedATSApp:
             self.ats_inference = RobustATSInference()
             self.job_recommender = EnhancedJobRecommender()
             self.gemini = get_gemini_client()
+            
+            # Load classifier and clustering models
+            self.load_additional_models()
         except Exception as e:
             st.error(f"❌ Initialization Error: {e}")
             st.stop()
         
         self._init_session_state()
+    
+    def load_additional_models(self):
+        """Load resume classifier and clustering models"""
+        import pickle
+        
+        # Load resume category classifier
+        try:
+            with open('resume_classifier_model.pkl', 'rb') as f:
+                self.category_model = pickle.load(f)
+            with open('tfidf_vectorizer.pkl', 'rb') as f:
+                self.tfidf_vectorizer = pickle.load(f)
+            st.session_state.category_model_loaded = True
+            print("✅ Resume category classifier loaded")
+        except:
+            self.category_model = None
+            self.tfidf_vectorizer = None
+            st.session_state.category_model_loaded = False
+            print("⚠️ Resume category classifier not found")
+        
+        # Load experience clustering model
+        try:
+            with open('clustering_model_optimized.pkl', 'rb') as f:
+                clustering_data = pickle.load(f)
+                self.clustering_model = clustering_data['model']
+                self.clustering_scaler = clustering_data['scaler']
+                self.clustering_pca = clustering_data['pca']
+                self.clustering_features = clustering_data['feature_columns']
+                self.clustering_labels = clustering_data['cluster_labels']
+            st.session_state.clustering_model_loaded = True
+            print("✅ Experience clustering model loaded")
+        except:
+            self.clustering_model = None
+            st.session_state.clustering_model_loaded = False
+            print("⚠️ Experience clustering model not found")
     
     def _init_session_state(self):
         st.session_state.setdefault('current_resume', None)
@@ -114,7 +156,7 @@ class AdvancedATSApp:
         st.session_state.setdefault('shortlisted_candidates', [])
         st.session_state.setdefault('recruiter_jds', [])
         st.session_state.setdefault('selected_jd', None)
-        st.session_state.setdefault('uploaded_resume_ids', set())  # Track uploaded resume IDs
+        st.session_state.setdefault('uploaded_resume_ids', set())
             
     def _rerun(self):
         """Safe rerun method"""
@@ -127,38 +169,20 @@ class AdvancedATSApp:
         """Setup sidebar configuration"""
         st.sidebar.title("🔧 Configuration")
         
-        # Model status
+        # Quick Stats
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🤖 Model Status")
-        model_status = self.ats_inference.get_model_status()
+        st.sidebar.subheader("📊 Quick Stats")
         
-        if model_status['transformer'] == 'Loaded':
-            st.sidebar.success("✅ Transformer: Loaded")
-        else:
-            st.sidebar.error("❌ Transformer: Error")
-        
-        if model_status['ml_model'] == 'Trained':
-            st.sidebar.success("✅ ATS Model: Trained")
-            if 'metrics' in model_status:
-                metrics = model_status['metrics']
-                st.sidebar.info(f"R² Score: {metrics.get('r2_test', 0):.3f}")
-                st.sidebar.info(f"MAE: {metrics.get('mae', 0):.2f}")
-        else:
-            st.sidebar.error("❌ ATS Model: Not Found")
-            st.sidebar.warning("⚠️ Please run train_model.py first!")
+        try:
+            resumes = self.db_manager.get_all_resumes()
+            jds = self.db_manager.get_all_jds()
             
-        # API status
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🔑 API Status")
-        if os.getenv('GEMINI_API_KEY'):
-            st.sidebar.success("✅ Gemini API: Configured")
-        else:
-            st.sidebar.warning("⚠️ Gemini API: Not Configured")
-            
-        if os.getenv('SERPAPI_KEY'):
-            st.sidebar.success("✅ SerpAPI: Configured")
-        else:
-            st.sidebar.warning("⚠️ SerpAPI: Not Configured")
+            st.sidebar.metric("📄 Total Resumes", len(resumes))
+            st.sidebar.metric("📋 Total JDs", len(jds))
+            st.sidebar.metric("👥 Session Uploads", len(st.session_state.get('recruiter_resumes', [])))
+            st.sidebar.metric("⭐ Shortlisted", len(st.session_state.get('shortlisted_candidates', [])))
+        except:
+            st.sidebar.info("Database stats unavailable")
 
         # Quick actions
         st.sidebar.markdown("---")
@@ -166,35 +190,9 @@ class AdvancedATSApp:
         
         if st.sidebar.button("🔄 Clear Session", use_container_width=True):
             for key in list(st.session_state.keys()):
-                del st.session_state[key]
+                if key not in ['category_model_loaded', 'clustering_model_loaded']:
+                    del st.session_state[key]
             self._rerun()
-        
-        if st.sidebar.button("📊 View Stats", use_container_width=True):
-            self.show_database_stats()
-
-    def show_database_stats(self):
-        """Show database statistics"""
-        try:
-            resumes = self.db_manager.get_all_resumes()
-            jds = self.db_manager.get_all_jds()
-            
-            st.sidebar.markdown("---")
-            st.sidebar.markdown("### 📈 Database Stats")
-            st.sidebar.write(f"📄 Resumes in DB: {len(resumes)}")
-            st.sidebar.write(f"📋 Job Descriptions: {len(jds)}")
-            
-            # Session stats
-            st.sidebar.markdown("### 📊 Session Stats")
-            st.sidebar.write(f"👥 Recruiter Uploads: {len(st.session_state.get('recruiter_resumes', []))}")
-            st.sidebar.write(f"⭐ Shortlisted: {len(st.session_state.get('shortlisted_candidates', []))}")
-            
-            # Calculate screening stats
-            screened = [c for c in st.session_state.get('recruiter_resumes', []) if c.get('ats_score', 0) > 0]
-            if screened:
-                avg_score = sum(c['ats_score'] for c in screened) / len(screened)
-                st.sidebar.write(f"📊 Avg ATS Score: {avg_score:.1f}")
-        except Exception as e:
-            st.sidebar.error(f"Error loading stats: {str(e)}")
 
     def job_seeker_portal(self):
         """Job Seeker Portal"""
@@ -296,6 +294,7 @@ class AdvancedATSApp:
             feature_score += 25
         
         total_score = (length_score * 0.3 + section_score * 0.4 + feature_score * 0.3)
+        total_score=max(total_score-4,0)
         
         feedback_details = {
             "Length": f"{word_count} words - {'Good' if 400 <= word_count <= 1200 else 'Needs adjustment'}",
@@ -356,85 +355,289 @@ class AdvancedATSApp:
 
         st.markdown("---")
 
-        if st.button("✅ Analyze Compatibility", use_container_width=True, type="primary"):
+        if st.button("✨ Analyze Compatibility", use_container_width=True, type="primary"):
             if not st.session_state.current_jd:
                 st.error("❌ Please upload or paste a Job Description first")
             else:
                 self.perform_ats_analysis()
 
     def perform_ats_analysis(self):
-        """Perform ATS analysis between resume and JD"""
+        """Perform simple matching analysis without unreliable models"""
         resume_text = st.session_state.current_resume['text']
         jd_text = st.session_state.current_jd['text']
         
-        with st.spinner("📄 Analyzing compatibility..."):
+        with st.spinner("🔄 Analyzing compatibility..."):
             try:
-                features, resume_emb, jd_emb = self.ats_inference.extract_features(resume_text, jd_text)
+                # Calculate simple matching metrics
+                keyword_match = self.calculate_keyword_match(resume_text, jd_text)
+                skill_match = self.calculate_skill_match(resume_text, jd_text)
+                semantic_similarity = self.calculate_semantic_similarity(resume_text, jd_text)
                 
-                if features is None:
-                    st.error("❌ Error extracting features. Please check your inputs.")
-                    return
+                # Overall match score (weighted average)
+                overall_match = (keyword_match * 0.4 + skill_match * 0.3 + semantic_similarity * 0.3)
                 
-                ats_score = self.ats_inference.predict_ats_score(features)
-                ats_category = self.ats_inference.get_ats_category(ats_score)
-                similarity = self.ats_inference.calculate_similarity_percentage(resume_emb, jd_emb)
-                
-                self.display_analysis_results(ats_score, ats_category, similarity, features)
+                self.display_simple_analysis_results(overall_match, keyword_match, skill_match, semantic_similarity)
             except Exception as e:
                 st.error(f"❌ Analysis error: {str(e)}")
-
-    def display_analysis_results(self, ats_score, ats_category, similarity, features):
-        """Display ATS analysis results"""
-        st.subheader("📊 Analysis Results")
+                import traceback
+                st.error(traceback.format_exc())
+    
+    def calculate_keyword_match(self, resume_text, jd_text):
+        """Calculate keyword matching percentage - IMPROVED LOGIC"""
+        import string
+    
+        resume_lower = resume_text.lower()
+        jd_lower = jd_text.lower()
+    
+        translator = str.maketrans('', '', string.punctuation)
+        resume_words = set(resume_lower.translate(translator).split())
+        jd_words = set(jd_lower.translate(translator).split())
+    
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+                 'of', 'with', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 
+                 'had', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can',
+                 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 
+                 'they', 'me', 'him', 'her', 'us', 'them'}
+    
+        resume_words = resume_words - stop_words
+        jd_words = jd_words - stop_words
+    
+    # FIX: Filter out very short words (less than 3 chars)
+        resume_words = {w for w in resume_words if len(w) >= 3}
+        jd_words = {w for w in jd_words if len(w) >= 3}
+    
+    # Calculate overlap
+        overlap = len(resume_words.intersection(jd_words))
+        total_jd_words = len(jd_words)
+    
+        if total_jd_words == 0:
+            return 0.0
+    
+    # FIX: Better percentage calculation with scaling
+        match_percentage = (overlap / total_jd_words) * 100
+    
+    # Apply slight boost for UX (industry standard calibration)
+        match_percentage = min(match_percentage * 1.1, 100.0)
+    
+        return match_percentage
+    
+    
+    def calculate_skill_match(self, resume_text, jd_text):
+        """Calculate skill matching percentage - EXPANDED SKILL LIST"""
+    # FIX: Comprehensive skill list
+        all_skills = [
+        # Programming Languages
+            'python', 'java', 'javascript', 'typescript', 'c++', 'c#', 'ruby', 'php', 
+            'swift', 'kotlin', 'go', 'rust', 'scala', 'r',
         
-        col1, col2, col3 = st.columns(3)
+        # Databases
+            'sql', 'nosql', 'mongodb', 'mysql', 'postgresql', 'oracle', 'redis', 
+            'cassandra', 'dynamodb', 'sqlite',
+        
+        # Web Technologies
+            'react', 'angular', 'vue', 'vue.js', 'node.js', 'nodejs', 'express', 
+            'django', 'flask', 'fastapi', 'spring', 'asp.net', '.net',
+            'html', 'css', 'sass', 'bootstrap', 'tailwind', 'jquery',
+        
+        # Cloud & DevOps
+            'aws', 'azure', 'gcp', 'google cloud', 'docker', 'kubernetes', 'jenkins', 
+            'ci/cd', 'terraform', 'ansible', 'gitlab', 'circleci',
+        
+        # Data Science & ML
+            'machine learning', 'ml', 'ai', 'artificial intelligence', 'deep learning',
+            'data analysis', 'data science', 'tensorflow', 'pytorch', 'keras',
+            'pandas', 'numpy', 'scikit-learn', 'spark', 'hadoop', 'tableau', 
+            'power bi', 'excel',
+        
+        # Tools & Others
+            'git', 'github', 'bitbucket', 'jira', 'confluence', 'slack',
+            'linux', 'unix', 'windows', 'macos', 'bash', 'shell',
+            'rest api', 'restful', 'graphql', 'api', 'microservices',
+            'agile', 'scrum', 'kanban', 'devops', 'testing', 'junit', 'pytest',
+        
+        # Soft Skills
+            'communication', 'leadership', 'teamwork', 'problem solving', 
+            'analytical', 'critical thinking', 'project management', 'time management',
+            'collaboration', 'adaptability', 'creativity'
+            ]
+    
+        resume_lower = resume_text.lower()
+        jd_lower = jd_text.lower()
+    
+    # Find skills in both texts
+        resume_skills = [skill for skill in all_skills if skill in resume_lower]
+        jd_skills = [skill for skill in all_skills if skill in jd_lower]
+    
+        if not jd_skills:
+            return 0.0
+    
+    # Calculate match
+        matched_skills = len(set(resume_skills).intersection(set(jd_skills)))
+        total_required = len(jd_skills)
+    
+        skill_match_percentage = (matched_skills / total_required) * 100
+    
+    # FIX: Apply realistic scaling
+        skill_match_percentage = min(skill_match_percentage * 1.05, 100.0)
+    
+        return skill_match_percentage
+
+
+    def calculate_semantic_similarity(self, resume_text, jd_text):
+        """Calculate semantic similarity using embeddings - FIXED LOGIC"""
+        try:
+            if hasattr(self.ats_inference, 'transformer_model') and self.ats_inference.transformer_model:
+            # Generate embeddings
+                resume_emb = self.ats_inference.transformer_model.encode([resume_text])[0]
+                jd_emb = self.ats_inference.transformer_model.encode([jd_text])[0]
+            
+            # FIX: Use proper cosine similarity calculation
+                from sklearn.metrics.pairwise import cosine_similarity
+                similarity = cosine_similarity([resume_emb], [jd_emb])[0][0]
+            
+            # FIX: Convert to percentage properly (0-1 range to 0-100)
+            # Apply slight boost for better UX (industry standard)
+                similarity_pct = min((similarity * 0.85 + 0.15) * 100, 100)
+            
+                return max(0, similarity_pct)
+            else:
+            # Fallback: use enhanced keyword matching
+                return self.calculate_keyword_match(resume_text, jd_text) * 0.75
+        except Exception as e:
+            print(f"Semantic similarity error: {e}")
+            return 0.0
+    
+    def display_simple_analysis_results(self, overall_match, keyword_match, skill_match, semantic_similarity):
+        """Display simple matching analysis results"""
+        st.subheader("📊 Resume-JD Compatibility Analysis")
+        
+        # Main metrics
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("ATS Score", f"{ats_score:.1f}/100")
+            st.metric("Overall Match", f"{overall_match:.1f}%")
         
         with col2:
-            category_class = ats_category.lower().replace(" ", "-")
-            st.markdown(f'<div class="score-card {category_class}"><h3>{ats_category}</h3></div>', 
-                       unsafe_allow_html=True)
+            st.metric("Keyword Match", f"{keyword_match:.1f}%")
         
         with col3:
-            st.metric("Semantic Similarity", f"{similarity:.1f}%")
+            st.metric("Skill Match", f"{skill_match:.1f}%")
         
-        fit_assessment = self.get_fit_assessment(ats_score)
-        st.info(f"🎯 **Fit Assessment:** {fit_assessment}")
+        with col4:
+            st.metric("Semantic Similarity", f"{semantic_similarity:.1f}%")
         
-        st.subheader("Score Breakdown")
-        st.progress(int(ats_score)/100)
-        
-        if ats_score < 50:
-            st.warning("⚠️ Your resume needs significant improvements to pass ATS screening")
-        elif ats_score < 70:
-            st.info("ℹ️ Good foundation, but optimization can improve your chances")
+        # Match category
+        if overall_match >= 70:
+            category = "Excellent Match"
+            category_class = "excellent-match"
+            message = "🎉 Excellent! Your resume is highly compatible with this job description."
+        elif overall_match >= 55:
+            category = "Good Match"
+            category_class = "good-match"
+            message = "👍 Good match! With some optimization, you can improve your chances."
+        elif overall_match >= 40:
+            category = "Moderate Match"
+            category_class = "potential-fit"
+            message = "⚡ Moderate fit. Consider tailoring your resume more closely to the job requirements."
         else:
-            st.success("🎉 Excellent! Your resume is well-optimized for ATS")
-
-        st.subheader("🤖 AI Feedback & Suggestions")
-        try:
-            feedback = self.gemini.generate_resume_feedback(
-                st.session_state.current_resume['text'],
-                st.session_state.current_jd['text'],
-                ats_score,
-                features
-            )
-            st.markdown(feedback)
-        except Exception as e:
-            st.warning("⚠️ Gemini API not available for detailed feedback.")
+            category = "Weak Match"
+            category_class = "weak-match"
+            message = "⚠️ Low match. Significant improvements needed to align with this position."
+        
+        st.markdown(f'<div class="score-card {category_class}"><h3>{category}</h3></div>', 
+                   unsafe_allow_html=True)
+        st.info(message)
+        
+        # Progress bars for each metric
+        st.subheader("📈 Detailed Breakdown")
+        
+        st.write("**Overall Match Score**")
+        st.progress(int(overall_match)/100)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Keyword Match**")
+            st.progress(int(keyword_match)/100)
+            if keyword_match < 40:
+                st.warning("💡 Try to include more keywords from the job description")
+        
+        with col2:
+            st.write("**Skill Match**")
+            st.progress(int(skill_match)/100)
+            if skill_match < 50:
+                st.warning("💡 Highlight more relevant technical skills")
+        
+        # Extract missing skills
+        st.subheader("🎯 Improvement Suggestions")
+        self.show_improvement_suggestions(
+            st.session_state.current_resume['text'],
+            st.session_state.current_jd['text'],
+            overall_match
+        )
+        
+        # AI Feedback (if available)
+        if self.gemini.is_working:
+            st.subheader("🤖 AI-Powered Feedback")
+            try:
+                feedback = self.gemini.generate_resume_feedback(
+                    st.session_state.current_resume['text'],
+                    st.session_state.current_jd['text'],
+                    overall_match,
+                    None
+                )
+                st.markdown(feedback)
+            except:
+                st.info("AI feedback temporarily unavailable")
     
-    def get_fit_assessment(self, ats_score):
-        """Get fit assessment based on score"""
-        if ats_score >= 75:
-            return "🎉 Excellent Fit - High probability of passing ATS"
-        elif ats_score >= 60:
-            return "👍 Good Fit - Strong match with job requirements"
-        elif ats_score >= 40:
-            return "🤔 Potential Fit - Some alignment, needs optimization"
+    def show_improvement_suggestions(self, resume_text, jd_text, overall_match):
+        """Show specific improvement suggestions"""
+        resume_lower = resume_text.lower()
+        jd_lower = jd_text.lower()
+        
+        # Find missing skills
+        all_skills = [
+            'python', 'java', 'javascript', 'sql', 'aws', 'docker', 'kubernetes',
+            'react', 'angular', 'vue', 'node.js', 'django', 'flask', 'machine learning',
+            'data analysis', 'agile', 'scrum', 'leadership', 'communication', 'teamwork'
+        ]
+        
+        jd_skills = [skill for skill in all_skills if skill in jd_lower]
+        resume_skills = [skill for skill in all_skills if skill in resume_lower]
+        missing_skills = [skill for skill in jd_skills if skill not in resume_skills]
+        
+        if missing_skills:
+            st.write("**🔑 Missing Key Skills:**")
+            st.write(", ".join(missing_skills[:10]))
+            st.info("💡 Consider adding these skills to your resume if you have experience with them")
+        
+        # Check for quantifiable achievements
+        has_numbers = bool(re.search(r'\d+%|\$\d+|\d+\+', resume_text))
+        if not has_numbers:
+            st.warning("💡 Add quantifiable achievements (e.g., 'Increased efficiency by 25%')")
+        
+        # Check for action verbs
+        action_verbs = ['managed', 'developed', 'created', 'implemented', 'led', 'designed', 'built']
+        has_action_verbs = any(verb in resume_lower for verb in action_verbs)
+        if not has_action_verbs:
+            st.warning("💡 Use strong action verbs (managed, developed, implemented, etc.)")
+        
+        # General suggestions based on match score
+        if overall_match < 40:
+            st.error("⚠️ **Major improvements needed:**")
+            st.write("- Carefully review the job description")
+            st.write("- Add relevant keywords and skills")
+            st.write("- Tailor your experience descriptions")
+            st.write("- Highlight matching qualifications")
+        elif overall_match < 60:
+            st.warning("**Suggested improvements:**")
+            st.write("- Include more relevant keywords")
+            st.write("- Emphasize matching skills and experience")
+            st.write("- Add quantifiable achievements")
         else:
-            return "❌ Poor Fit - Significant improvements needed"
+            st.success("**Nice work! Minor refinements:**")
+            st.write("- Ensure all key requirements are addressed")
+            st.write("- Quantify your achievements where possible")
+            st.write("- Use industry-specific terminology")
     
     def job_recommendations_section(self):
         """Job recommendations based on resume"""
@@ -467,8 +670,8 @@ class AdvancedATSApp:
         
         limit = st.slider("Number of Recommendations", 3, 10, 5)
         
-        if st.button("🔍 Find Job Recommendations", type="primary"):
-            with st.spinner("🔍 Searching for matching jobs via SerpAPI..."):
+        if st.button("🔎 Find Job Recommendations", type="primary"):
+            with st.spinner("🔍 Searching for matching jobs..."):
                 recommendations = self.job_recommender.get_job_recommendations(
                     skills, experience, location, limit
                 )
@@ -498,7 +701,7 @@ class AdvancedATSApp:
                             
                             st.markdown('</div>', unsafe_allow_html=True)
                 else:
-                    st.error("❌ No job recommendations found. Try adjusting your search criteria or check SerpAPI key.")
+                    st.error("❌ No job recommendations found. Try adjusting your search criteria.")
     
     def virtual_assistant_section(self):
         """CareerGPT Virtual Assistant"""
@@ -584,7 +787,7 @@ class AdvancedATSApp:
         st.markdown('<div class="portal-header"><h1>🏢 Recruiter Portal</h1><p>Upload resumes, create job descriptions, and screen candidates</p></div>', 
                    unsafe_allow_html=True)
         
-        tab1, tab2, tab3 = st.tabs(["📄 Upload Resumes", "📋 Create Job Description", "👥 Screen & Shortlist"])
+        tab1, tab2, tab3, tab4 = st.tabs(["📄 Upload Resumes", "📋 Create Job Description", "👥 Screen Candidates", "📊 Classify by Experience"])
         
         with tab1:
             self.upload_resumes_section()
@@ -594,12 +797,15 @@ class AdvancedATSApp:
         
         with tab3:
             self.screen_candidates_section()
+        
+        with tab4:
+            self.classify_candidates_section()
     
     def upload_resumes_section(self):
-        """Section for recruiters to upload multiple resumes - FIXED DUPLICATE BUG"""
+        """Section for recruiters to upload multiple resumes"""
         st.subheader("📄 Upload Candidate Resumes")
         
-        st.info("💡 Upload multiple resumes to build your candidate pool. These will appear in the screening section.")
+        st.info("💡 Upload multiple resumes to build your candidate pool.")
         
         uploaded_files = st.file_uploader(
             "Choose candidate resume files (PDF, DOCX, PNG, JPG, JPEG)",
@@ -609,13 +815,10 @@ class AdvancedATSApp:
         )
         
         if uploaded_files:
-            # Process each file only once
             for resume_file in uploaded_files:
-                # Create unique file identifier using hash of content
                 file_bytes = resume_file.getvalue()
                 file_hash = hash(file_bytes)
                 
-                # Check if this file has already been processed
                 if file_hash in st.session_state.uploaded_resume_ids:
                     continue
                 
@@ -624,6 +827,10 @@ class AdvancedATSApp:
                     
                     if resume_text:
                         candidate_id = str(uuid.uuid4())[:8]
+                        
+                        # Classify resume category
+                        category = self.classify_resume_category(resume_text)
+                        
                         candidate = {
                             'id': candidate_id,
                             'file_hash': file_hash,
@@ -634,14 +841,15 @@ class AdvancedATSApp:
                             'uploaded_at': time.strftime("%Y-%m-%d %H:%M:%S"),
                             'status': 'pending',
                             'ats_score': 0,
+                            'category': category,
                             'skills': self.extract_skills_from_resume(resume_text),
-                            'experience': self.extract_experience_from_resume(resume_text)
+                            'experience': self.extract_experience_from_resume(resume_text),
+                            'experience_level': None
                         }
                         
-                        # Add to session state and mark as processed
                         st.session_state.recruiter_resumes.append(candidate)
                         st.session_state.uploaded_resume_ids.add(file_hash)
-                        st.success(f"✅ {resume_file.name} uploaded successfully!")
+                        st.success(f"✅ {resume_file.name} uploaded - Category: {category}")
                     else:
                         st.error(f"❌ Could not extract text from {resume_file.name}")
         
@@ -653,6 +861,7 @@ class AdvancedATSApp:
                 
                 with col1:
                     st.write(f"**{candidate['name']}**")
+                    st.write(f"Category: {candidate.get('category', 'Unknown')}")
                     st.write(f"Skills: {', '.join(candidate['skills'][:5]) if candidate['skills'] else 'Not detected'}")
                     st.write(f"Experience: {candidate['experience']} years")
                 
@@ -664,12 +873,12 @@ class AdvancedATSApp:
                     }.get(candidate['status'], 'gray')
                     st.markdown(f"Status: <span style='color: {status_color}; font-weight: bold;'>{candidate['status'].title()}</span>", 
                               unsafe_allow_html=True)
-                    st.write(f"Uploaded: {candidate['uploaded_at']}")
+                    if candidate.get('experience_level'):
+                        st.info(f"Level: {candidate['experience_level']}")
                 
                 with col3:
-                    # Use unique key for each button
                     if st.button("👀 View", key=f"view_resume_{candidate['id']}"):
-                        with st.expander(f"Resume Content - {candidate['name']}", expanded=True):
+                        with st.expander(f"Resume - {candidate['name']}", expanded=True):
                             st.text_area("Resume Text", candidate['resume_text'], height=200, key=f"resume_text_{candidate['id']}")
                 
                 st.markdown("---")
@@ -679,8 +888,53 @@ class AdvancedATSApp:
             st.session_state.uploaded_resume_ids = set()
             self._rerun()
     
+    def classify_resume_category(self, resume_text):
+        """Classify resume into job category"""
+        if self.category_model and self.tfidf_vectorizer:
+            try:
+                cleaned_text = self.preprocess_text(resume_text)
+                if not cleaned_text or len(cleaned_text.strip()) < 10:
+                    return "Unknown"
+                 
+
+
+                vectorized = self.tfidf_vectorizer.transform([cleaned_text])
+                prediction = self.category_model.predict(vectorized)[0]
+                return prediction
+            except Exception as e:
+                print(f"Classification error: {e}")
+                return "Unknown"
+        else:
+            print("⚠️ Category model not loaded")
+            return "Unknown"
+    
+    def preprocess_text(self, text):
+        """Clean text for classification - IMPROVED"""
+        if not text:
+            return ""
+    
+        text = str(text).lower()
+    
+    # Remove URLs
+        text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    
+    # Remove email addresses
+        text = re.sub(r'\S+@\S+', '', text)
+    
+    # Remove special characters but keep spaces
+        text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
+    
+    # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+    
+    # FIX: Ensure minimum length
+        if len(text) < 10:
+            return ""
+    
+            return text
+    
     def upload_jd_section(self):
-        """Section for uploading job description - FIXED DUPLICATE WIDGET BUG"""
+        """Section for uploading job description"""
         st.subheader("📋 Create Job Description")
         
         jd_file = st.file_uploader(
@@ -711,43 +965,43 @@ class AdvancedATSApp:
             with col4:
                 experience_required = st.number_input("Years Experience Required", min_value=0, max_value=30, value=3, key="jd_exp_input")
             
-            # FIXED: Unique button key
-            if st.button("💾 Save Job Description", type="primary", key="save_jd_button_unique") and title and company:
-                jd_id = str(uuid.uuid4())[:8]
-                jd_data = {
-                    'id': jd_id,
-                    'title': title,
-                    'company': company,
-                    'location': location,
-                    'experience_required': experience_required,
-                    'description_text': jd_text,
-                    'created_at': time.strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                if 'recruiter_jds' not in st.session_state:
-                    st.session_state.recruiter_jds = []
-                
-                st.session_state.recruiter_jds.append(jd_data)
-                st.session_state.selected_jd = jd_data
-                
-                st.success("✅ Job description saved successfully!")
-                
-                skills = self.extract_skills_from_text(jd_text)
-                if skills:
-                    st.write(f"**Key Skills Required:** {', '.join(skills[:10])}")
-            elif st.button("💾 Save Job Description", type="primary", key="save_jd_button_unique_error"):
-                st.error("❌ Please fill in all required fields (Title and Company)")
+            if st.button("💾 Save Job Description", type="primary", key="save_jd_button_recruiter"):
+                if title and company:
+                    jd_id = str(uuid.uuid4())[:8]
+                    jd_data = {
+                        'id': jd_id,
+                        'title': title,
+                        'company': company,
+                        'location': location,
+                        'experience_required': experience_required,
+                        'description_text': jd_text,
+                        'created_at': time.strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    
+                    if 'recruiter_jds' not in st.session_state:
+                        st.session_state.recruiter_jds = []
+                    
+                    st.session_state.recruiter_jds.append(jd_data)
+                    st.session_state.selected_jd = jd_data
+                    
+                    st.success("✅ Job description saved successfully!")
+                    
+                    skills = self.extract_skills_from_text(jd_text)
+                    if skills:
+                        st.write(f"**Key Skills Required:** {', '.join(skills[:10])}")
+                else:
+                    st.error("❌ Please fill in all required fields (Title and Company)")
     
     def screen_candidates_section(self):
         """Screen and shortlist candidates against job description"""
         st.subheader("👥 Screen & Shortlist Candidates")
         
         if not st.session_state.recruiter_resumes:
-            st.warning("⚠️ Please upload some resumes first in the 'Upload Resumes' tab")
+            st.warning("⚠️ Please upload some resumes first")
             return
         
         if 'recruiter_jds' not in st.session_state or not st.session_state.recruiter_jds:
-            st.warning("⚠️ Please create a job description first in the 'Create Job Description' tab")
+            st.warning("⚠️ Please create a job description first")
             return
         
         jd_options = {f"{jd['title']} at {jd['company']}": jd for jd in st.session_state.recruiter_jds}
@@ -758,10 +1012,9 @@ class AdvancedATSApp:
         
         st.write(f"**Selected JD:** {selected_jd['title']} at {selected_jd['company']}")
         st.write(f"**Location:** {selected_jd['location']} | **Experience Required:** {selected_jd['experience_required']} years")
-        st.write(f"**Description Preview:** {selected_jd['description_text'][:200]}...")
         
         if st.button("🚀 Screen All Candidates", type="primary", use_container_width=True, key="screen_all_btn"):
-            with st.spinner("📄 Screening candidates against job description..."):
+            with st.spinner("🔄 Screening candidates..."):
                 jd_text = selected_jd['description_text']
                 screened_candidates = []
                 
@@ -771,13 +1024,26 @@ class AdvancedATSApp:
                 for idx, candidate in enumerate(st.session_state.recruiter_resumes):
                     resume_text = candidate['resume_text']
                     
-                    features, _, _ = self.ats_inference.extract_features(resume_text, jd_text)
+                    # Calculate similarity score (0-100)
+                    keyword_match = self.calculate_keyword_match(resume_text, jd_text)
+                    skill_match = self.calculate_skill_match(resume_text, jd_text)
+                    semantic_similarity = self.calculate_semantic_similarity(resume_text, jd_text)
                     
-                    if features is not None:
-                        ats_score = self.ats_inference.predict_ats_score(features)
-                        candidate['ats_score'] = ats_score
-                        candidate['fit_category'] = self.ats_inference.get_ats_category(ats_score)
-                        candidate['screened_at'] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    # Overall similarity score (weighted average)
+                    similarity_score = (keyword_match * 0.4 + skill_match * 0.3 + semantic_similarity * 0.3)
+                    
+                    candidate['ats_score'] = round(similarity_score, 1)
+                    candidate['keyword_match'] = round(keyword_match, 1)
+                    candidate['skill_match'] = round(skill_match, 1)
+                    candidate['semantic_similarity'] = round(semantic_similarity, 1)
+                    candidate['fit_category'] = self.get_similarity_category(similarity_score)
+                    candidate['screened_at'] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Get recruiter decision prediction
+                    decision_pred = self.predict_recruiter_decision(resume_text, jd_text)
+                    if decision_pred:
+                        candidate['predicted_decision'] = decision_pred['decision']
+                        candidate['decision_confidence'] = decision_pred['confidence']
                     
                     screened_candidates.append(candidate)
                     progress_bar.progress((idx + 1) / total_candidates)
@@ -788,7 +1054,7 @@ class AdvancedATSApp:
                 st.success(f"✅ Screened {len(screened_candidates)} candidates!")
         
         if any(candidate.get('ats_score') for candidate in st.session_state.recruiter_resumes):
-            st.subheader(f"📊 Screening Results for {selected_jd['title']}")
+            st.subheader(f"📊 Screening Results")
             
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -796,7 +1062,7 @@ class AdvancedATSApp:
             with col2:
                 status_filter = st.selectbox("Status Filter", ["All", "Pending", "Shortlisted", "Rejected"], key="status_filter_select")
             with col3:
-                sort_by = st.selectbox("Sort By", ["ATS Score", "Experience", "Name"], key="sort_by_select")
+                sort_by = st.selectbox("Sort By", ["ATS Score", "Predicted Decision", "Experience"], key="sort_by_select")
             
             filtered_candidates = [c for c in st.session_state.recruiter_resumes 
                                  if c.get('ats_score', 0) >= min_score]
@@ -806,17 +1072,16 @@ class AdvancedATSApp:
             
             if sort_by == "ATS Score":
                 filtered_candidates.sort(key=lambda x: x.get('ats_score', 0), reverse=True)
-            elif sort_by == "Experience":
-                filtered_candidates.sort(key=lambda x: x.get('experience', 0), reverse=True)
+            elif sort_by == "Predicted Decision":
+                filtered_candidates.sort(key=lambda x: x.get('decision_confidence', 0), reverse=True)
             else:
-                filtered_candidates.sort(key=lambda x: x['name'])
+                filtered_candidates.sort(key=lambda x: x.get('experience', 0), reverse=True)
             
             st.write(f"**Showing {len(filtered_candidates)} candidates**")
             
             for candidate in filtered_candidates:
                 candidate_class = candidate['status']
                 ats_score = candidate.get('ats_score', 0)
-                fit_category = candidate.get('fit_category', 'Not Screened')
                 
                 st.markdown(f'<div class="candidate-card {candidate_class}">', unsafe_allow_html=True)
                 
@@ -824,13 +1089,17 @@ class AdvancedATSApp:
                 
                 with col1:
                     st.write(f"### {candidate['name']}")
-                    st.write(f"**Skills:** {', '.join(candidate['skills'][:5]) if candidate['skills'] else 'Not detected'}")
+                    st.write(f"**Category:** {candidate.get('category', 'Unknown')}")
+                    st.write(f"**Skills:** {', '.join(candidate['skills'][:5]) if candidate['skills'] else 'N/A'}")
                     st.write(f"**Experience:** {candidate['experience']} years")
-                    st.write(f"**File:** {candidate['filename']}")
                 
                 with col2:
                     st.metric("ATS Score", f"{ats_score:.1f}")
-                    st.write(f"**Fit:** {fit_category}")
+                    st.write(f"**Fit:** {candidate.get('fit_category', 'N/A')}")
+                    if candidate.get('predicted_decision'):
+                        decision_emoji = "✅" if candidate['predicted_decision'].lower() == 'select' else "❌"
+                        st.write(f"**AI Prediction:** {decision_emoji} {candidate['predicted_decision']}")
+                        st.write(f"Confidence: {candidate.get('decision_confidence', 0):.1f}%")
                 
                 with col3:
                     current_status = candidate['status']
@@ -856,13 +1125,9 @@ class AdvancedATSApp:
                             self._rerun()
                 
                 with col4:
-                    if st.button("👀 View Resume", key=f"view_res_btn_{candidate['id']}", use_container_width=True):
+                    if st.button("👀 View", key=f"view_res_btn_{candidate['id']}", use_container_width=True):
                         with st.expander(f"Resume - {candidate['name']}", expanded=True):
-                            st.text_area("Resume Content", candidate['resume_text'], height=200, 
-                                       key=f"resume_view_area_{candidate['id']}")
-                    
-                    if st.button("📋 Contact", key=f"contact_btn_{candidate['id']}", use_container_width=True):
-                        st.info(f"Contact: {candidate['email']}")
+                            st.text_area("Content", candidate['resume_text'], height=200, key=f"view_area_{candidate['id']}")
                 
                 st.markdown('</div>', unsafe_allow_html=True)
             
@@ -877,17 +1142,16 @@ class AdvancedATSApp:
                 with col2:
                     st.metric("Average Score", f"{avg_score:.1f}")
                 
-                if st.button("📤 Export Shortlisted Candidates", key="export_shortlisted_btn"):
+                if st.button("📤 Export Shortlisted", key="export_shortlisted_btn"):
                     shortlisted_data = []
                     for candidate in st.session_state.shortlisted_candidates:
                         shortlisted_data.append({
                             'Name': candidate['name'],
                             'Email': candidate['email'],
                             'ATS Score': candidate.get('ats_score', 0),
-                            'Fit Category': candidate.get('fit_category', 'Not Screened'),
+                            'Category': candidate.get('category', 'Unknown'),
                             'Experience': candidate['experience'],
-                            'Skills': ', '.join(candidate['skills']) if candidate['skills'] else '',
-                            'Screened At': candidate.get('screened_at', 'Not Screened')
+                            'Skills': ', '.join(candidate['skills']) if candidate['skills'] else ''
                         })
                     
                     df = pd.DataFrame(shortlisted_data)
@@ -895,11 +1159,116 @@ class AdvancedATSApp:
                     st.download_button(
                         label="📥 Download CSV",
                         data=csv,
-                        file_name=f"shortlisted_candidates_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+                        file_name=f"shortlisted_{time.strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv",
                         key="download_csv_btn"
                     )
-
+    
+    def classify_candidates_section(self):
+        """Classify candidates by experience level"""
+        st.subheader("📊 Classify Candidates by Experience Level")
+        
+        if not st.session_state.recruiter_resumes:
+            st.warning("⚠️ Please upload some resumes first")
+            return
+        
+        if st.button("🎯 Classify All Candidates", type="primary", use_container_width=True):
+            with st.spinner("🔄 Classifying candidates by experience level..."):
+                for candidate in st.session_state.recruiter_resumes:
+                    experience_level = self.predict_experience_level_simple(candidate['resume_text'], candidate['experience'])
+                    candidate['experience_level'] = experience_level
+                
+                st.success("✅ All candidates classified!")
+                self._rerun()
+        
+        # Show all candidates with their classifications
+        classified_candidates = [c for c in st.session_state.recruiter_resumes]
+        
+        if classified_candidates:
+            # Summary statistics
+            st.subheader("📈 Distribution by Experience Level")
+            
+            level_counts = {'Entry-Level': 0, 'Mid-Level': 0, 'Senior-Level': 0, 'Unknown': 0}
+            for candidate in classified_candidates:
+                level = candidate.get('experience_level', 'Unknown')
+                if level in level_counts:
+                    level_counts[level] += 1
+                else:
+                    level_counts['Unknown'] += 1
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Entry-Level", level_counts['Entry-Level'])
+            with col2:
+                st.metric("Mid-Level", level_counts['Mid-Level'])
+            with col3:
+                st.metric("Senior-Level", level_counts['Senior-Level'])
+            with col4:
+                st.metric("Unknown", level_counts['Unknown'])
+            
+            # Filter by level
+            level_filter = st.selectbox("Filter by Level", ["All", "Entry-Level", "Mid-Level", "Senior-Level", "Unknown"])
+            
+            filtered = classified_candidates
+            if level_filter != "All":
+                filtered = [c for c in filtered if c.get('experience_level') == level_filter]
+            
+            st.write(f"**Showing {len(filtered)} candidates**")
+            
+            for candidate in filtered:
+                level = candidate.get('experience_level', 'Unknown')
+                # Fix: Check if level exists and is not None
+                level_class = level.lower().replace('-', '') if level and level != 'Unknown' else 'pending'
+                
+                st.markdown(f'<div class="candidate-card {level_class}">', unsafe_allow_html=True)
+                
+                col1, col2, col3 = st.columns([4, 2, 2])
+                
+                with col1:
+                    st.write(f"### {candidate['name']}")
+                    st.write(f"**Level:** {level if level else 'Unknown'}")
+                    st.write(f"**Category:** {candidate.get('category', 'Unknown')}")
+                    st.write(f"**Experience:** {candidate['experience']} years")
+                    st.write(f"**Skills:** {', '.join(candidate['skills'][:5]) if candidate['skills'] else 'N/A'}")
+                
+                with col2:
+                    if candidate.get('ats_score'):
+                        st.metric("Similarity Score", f"{candidate['ats_score']:.1f}%")
+                    st.write(f"**Status:** {candidate['status'].title()}")
+                
+                with col3:
+                    if st.button("👀 View", key=f"view_classified_{candidate['id']}", use_container_width=True):
+                        with st.expander(f"Resume - {candidate['name']}", expanded=True):
+                            st.text_area("Content", candidate['resume_text'], height=200, key=f"classified_text_{candidate['id']}")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.info("No candidates to classify yet. Upload resumes first.")
+    
+    def predict_recruiter_decision(self, resume_text, jd_text):
+        """Predict recruiter decision (Select/Reject)"""
+        try:
+            # Simple rule-based decision
+            keyword_match = self.calculate_keyword_match(resume_text, jd_text)
+            skill_match = self.calculate_skill_match(resume_text, jd_text)
+            semantic_similarity = self.calculate_semantic_similarity(resume_text, jd_text)
+            
+            overall_score = (keyword_match * 0.4 + skill_match * 0.3 + semantic_similarity * 0.3)
+            
+            if overall_score >= 60:
+                decision = "Select"
+                confidence = overall_score
+            else:
+                decision = "Reject"
+                confidence = 100 - overall_score
+            
+            return {
+                'decision': decision,
+                'confidence': min(confidence, 100)
+            }
+        except:
+            return None
+    
     def extract_skills_from_text(self, text):
         """Extract skills from any text"""
         if not text:
@@ -907,12 +1276,65 @@ class AdvancedATSApp:
             
         skills_keywords = [
             'Python', 'Java', 'SQL', 'JavaScript', 'Machine Learning', 
-            'Data Analysis', 'AWS', 'Docker', 'Communication', 'Teamwork',
-            'React', 'Angular', 'Vue', 'Node.js', 'Express', 'Django',
-            'Flask', 'MongoDB', 'MySQL', 'PostgreSQL', 'Git', 'GitHub'
+            'Data Analysis', 'AWS', 'Docker', 'React', 'Angular', 'Vue',
+            'Node.js', 'Express', 'Django', 'Flask', 'MongoDB', 'PostgreSQL',
+            'Git', 'GitHub', 'Jenkins', 'Kubernetes', 'Linux', 'Agile',
+            'Scrum', 'C++', 'C#', 'Ruby', 'PHP', 'Swift', 'Kotlin',
+            'TensorFlow', 'PyTorch', 'Pandas', 'NumPy', 'Communication',
+            'Leadership', 'Teamwork', 'Problem Solving', 'Project Management'
         ]
         found_skills = [skill for skill in skills_keywords if skill.lower() in text.lower()]
         return found_skills
+
+    def get_similarity_category(self, score):
+        """Get category based on similarity score"""
+        if score >= 70:
+            return "Excellent Match"
+        elif score >= 55:
+            return "Good Match"
+        elif score >= 40:
+            return "Moderate Match"
+        else:
+            return "Weak Match"
+
+
+    
+    def predict_experience_level_simple(self, resume_text, years_experience):
+        """Simple rule-based experience level prediction"""
+        if not resume_text:
+            return "Unknown"
+        
+        resume_lower = resume_text.lower()
+        
+        # Count senior/leadership indicators
+        senior_keywords = ['senior', 'sr.', 'sr', 'lead', 'architect', 'principal', 'manager', 
+                          'director', 'head', 'vp', 'chief', 'expert']
+        leadership_keywords = ['led', 'managed', 'mentored', 'supervised', 'directed', 
+                             'spearheaded', 'oversaw', 'managing', 'leading']
+        entry_keywords = ['fresher', 'intern', 'graduate', 'entry', 'trainee', 'junior', 'beginner']
+        
+        senior_count = sum(1 for kw in senior_keywords if kw in resume_lower)
+        leadership_count = sum(1 for kw in leadership_keywords if kw in resume_lower)
+        entry_count = sum(1 for kw in entry_keywords if kw in resume_lower)
+        
+        # Calculate score
+        score = 0
+        score += senior_count * 3
+        score += leadership_count * 2
+        score -= entry_count * 2
+        score += years_experience
+        
+        # Classify
+        if years_experience >= 8 or score >= 15:
+            return "Senior-Level"
+        elif years_experience >= 4 or score >= 8:
+            return "Mid-Level"
+        elif years_experience >= 1 or score >= 0:
+            return "Mid-Level" if score >= 5 else "Entry-Level"
+        else:
+            return "Entry-Level"
+
+    
 
     def run(self):
         """Main application runner"""
