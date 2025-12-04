@@ -1,4 +1,5 @@
 🎯 Advanced ATS — AI-Powered Resume Screening & Job Matching
+
 📋 Overview
 
 Advanced ATS is an intelligent, AI-driven Applicant Tracking System that helps
@@ -56,6 +57,7 @@ python experience_classifier.py
 python train_recruitor_decision_model.py
 
 ▶️Run App
+
 streamlit run app.py
 
 App available at ➡️http://localhost:8501.
