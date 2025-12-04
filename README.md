@@ -65,6 +65,7 @@ GEMINI_API_KEY=your_gemini_api_key_here
 SERPAPI_KEY=your_serpapi_key_here
 
 📥Initialize DB & Train 
+
 python setup_database.py
 python train_ats_score.py
 python resume_classifier.py
@@ -74,8 +75,6 @@ python train_recruitor_decision_model.py
 ▶️Run App
 
 streamlit run app.py
-
-App available at ➡️http://localhost:8501.
 
 🔍How It Works
 
