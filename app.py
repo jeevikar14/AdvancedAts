@@ -115,39 +115,56 @@ class AdvancedATSApp:
         self._init_session_state()
     
     def load_additional_models(self):
-        """Load resume classifier and clustering models"""
+        """Load resume classifier and clustering models - FIXED VERSION"""
         import pickle
-        
-        # Load resume category classifier
+
+        # Load resume category classifier - FIXED FILE NAMES
         try:
+            # Load the model and vectorizer separately
             with open('resume_classifier_model.pkl', 'rb') as f:
                 self.category_model = pickle.load(f)
             with open('tfidf_vectorizer.pkl', 'rb') as f:
                 self.tfidf_vectorizer = pickle.load(f)
+
             st.session_state.category_model_loaded = True
             print("✅ Resume category classifier loaded")
-        except:
-            self.category_model = None
-            self.tfidf_vectorizer = None
-            st.session_state.category_model_loaded = False
-            print("⚠️ Resume category classifier not found")
-        
-        # Load experience clustering model
+            print(f"   Model type: {type(self.category_model).__name__}")
+        except Exception as e:
+            print(f"⚠️ Could not load category classifier: {e}")
+            print("   Trying alternative format...")
+
+            # Fallback: Try loading complete model data
+            try:
+                with open('resume_classifier_complete.pkl', 'rb') as f:
+                    model_data = pickle.load(f)
+                    self.category_model = model_data.get('model')
+                    self.tfidf_vectorizer = model_data.get('vectorizer')
+
+                st.session_state.category_model_loaded = True
+                print("✅ Resume category classifier loaded (complete format)")
+            except Exception as e2:
+                print(f"❌ Failed to load category classifier: {e2}")
+                self.category_model = None
+                self.tfidf_vectorizer = None
+                st.session_state.category_model_loaded = False
+
+        # Load experience clustering model (moved inside method)
         try:
             with open('clustering_model_optimized.pkl', 'rb') as f:
                 clustering_data = pickle.load(f)
-                self.clustering_model = clustering_data['model']
-                self.clustering_scaler = clustering_data['scaler']
-                self.clustering_pca = clustering_data['pca']
-                self.clustering_features = clustering_data['feature_columns']
-                self.clustering_labels = clustering_data['cluster_labels']
+                self.clustering_model = clustering_data.get('model')
+                self.clustering_scaler = clustering_data.get('scaler')
+                self.clustering_pca = clustering_data.get('pca')
+                self.clustering_features = clustering_data.get('feature_columns')
+                self.clustering_labels = clustering_data.get('cluster_labels')
             st.session_state.clustering_model_loaded = True
             print("✅ Experience clustering model loaded")
-        except:
+        except Exception as e:
+            print(f"⚠️ Experience clustering model not found: {e}")
             self.clustering_model = None
             st.session_state.clustering_model_loaded = False
-            print("⚠️ Experience clustering model not found")
     
+
     def _init_session_state(self):
         st.session_state.setdefault('current_resume', None)
         st.session_state.setdefault('current_jd', None)
@@ -889,50 +906,74 @@ class AdvancedATSApp:
             self._rerun()
     
     def classify_resume_category(self, resume_text):
-        """Classify resume into job category"""
-        if self.category_model and self.tfidf_vectorizer:
-            try:
-                cleaned_text = self.preprocess_text(resume_text)
-                if not cleaned_text or len(cleaned_text.strip()) < 10:
-                    return "Unknown"
-                 
-
-
-                vectorized = self.tfidf_vectorizer.transform([cleaned_text])
-                prediction = self.category_model.predict(vectorized)[0]
-                return prediction
-            except Exception as e:
-                print(f"Classification error: {e}")
-                return "Unknown"
-        else:
+        """Classify resume into job category - FIXED VERSION"""
+        # Check if model is loaded
+        if not getattr(self, 'category_model', None) or not getattr(self, 'tfidf_vectorizer', None):
             print("⚠️ Category model not loaded")
             return "Unknown"
+
+        try:
+            # Clean text using the SAME preprocessing as training
+            cleaned_text = self.preprocess_text(resume_text)
+
+            # Validate cleaned text
+            if not cleaned_text or len(cleaned_text.strip()) < 10:
+                print(f"⚠️ Resume text too short after cleaning (length: {len(cleaned_text)})")
+                return "Unknown"
+
+            # Vectorize the text
+            vectorized = self.tfidf_vectorizer.transform([cleaned_text])
+
+            # Make prediction
+            prediction = self.category_model.predict(vectorized)[0]
+
+            # Optional: Get confidence score (if model supports it)
+            try:
+                if hasattr(self.category_model, 'predict_proba'):
+                    probabilities = self.category_model.predict_proba(vectorized)[0]
+                    confidence = max(probabilities)
+                    print(f"✓ Predicted: {prediction} (confidence: {confidence:.2%})")
+                else:
+                    print(f"✓ Predicted: {prediction}")
+            except:
+                print(f"✓ Predicted: {prediction}")
+
+            return prediction
+
+        except Exception as e:
+            print(f"❌ Classification error: {e}")
+            import traceback
+            traceback.print_exc()
+            return "Unknown"
     
+   
     def preprocess_text(self, text):
-        """Clean text for classification - IMPROVED"""
-        if not text:
+        """Clean text for classification - MUST MATCH TRAINING PREPROCESSING EXACTLY"""
+        # Handle None or NaN
+        if not text or pd.isna(text):
             return ""
-    
+
+        # Convert to string and lowercase
         text = str(text).lower()
-    
-    # Remove URLs
+
+        # Remove URLs (must match training exactly)
         text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
-    
-    # Remove email addresses
+
+        # Remove email addresses (must match training exactly)
         text = re.sub(r'\S+@\S+', '', text)
-    
-    # Remove special characters but keep spaces
+
+        # Remove special characters but keep spaces (must match training exactly)
         text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
-    
-    # Remove extra whitespace
+
+        # Remove extra whitespace (must match training exactly)
         text = re.sub(r'\s+', ' ', text).strip()
-    
-    # FIX: Ensure minimum length
+
+        # Ensure minimum length (must match training exactly)
         if len(text) < 10:
             return ""
-    
-            return text
-    
+
+        return text
+
     def upload_jd_section(self):
         """Section for uploading job description"""
         st.subheader("📋 Create Job Description")
